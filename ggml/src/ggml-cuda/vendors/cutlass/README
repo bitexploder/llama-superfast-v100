@@ -1,0 +1,12 @@
+CUTLASS 4.4.2 (vendored headers)
+
+Source:   NVIDIA CUTLASS, tag v4.4.2, commit da5e086dab31d63815acafdac9a9c5893b1c69e2
+          (https://github.com/NVIDIA/cutlass), copied unmodified
+          (include/cutlass/version.h reads 4, 4, 2). This is the CUTLASS version
+          1Cat-vLLM 99bbedf builds its sm70_v37 attention operator with.
+Contents: include/cutlass/ and include/cute/ (unmodified), LICENSE.txt.
+Licence:  BSD-3-Clause, see LICENSE.txt (Copyright (c) 2017 - 2026 NVIDIA
+          CORPORATION & AFFILIATES).
+Used by:  ggml/src/ggml-cuda/fattn-gqa6.cu only (Volta prompt attention
+          with 6 query heads per KV head). CMakeLists.txt adds include/ to the
+          include path of the CUDA sources only.
