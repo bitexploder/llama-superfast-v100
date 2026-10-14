@@ -6,6 +6,23 @@ We have made llama ultra superfast for v100. We specialize in two models: Qwen 2
 
 The operational models are pretty simple: 27B can run one user on two cards or one user on one card. It's fast in either mode. Flash Next can run with one user on two cards. Two users on two cards for flash next is still experimental. I don't recommend it yet.
 
+## Headline figures: Qwen3.8-27B
+
+Tesla V100 32 GB PCIe cards, MTP speculative decoding, temperature 1.0. Decode speeds are the server's steady rate on real coding-agent work. Prefill means a cold prompt with nothing cached.
+
+- **One user, one card (131,072-token context).**
+  - **Decode:** about 100–113 tok/s on long agentic coding sessions, and about 125 tok/s on short coding tasks.
+  - **Prefill:** 951 tok/s for a 16K prompt and 770 tok/s for a 64K prompt.
+- **One user, two cards (tensor parallel).**
+  - **Decode:** 152–156 tok/s on the same agentic work, 1.35× one card.
+  - **Prefill:** averages 1,383 tok/s reading a prompt up to 64K, 969 tok/s up to 128K and 686 tok/s up to 240K. On agents' real requests it reads 1.7× as fast as one card.
+- **Two users, two cards (131,072 tokens each).**
+  - **Decode:** about 200 tok/s combined while both users are decoding (about 100 each), and 150–160 tok/s for one user while the other is idle.
+  - **Prefill:** each user's prompts read at 1,020–1,080 tok/s of its own GPU time, or 800–830 tok/s by the wall clock with the other user active.
+  - **Throughput:** over a whole agentic session, the pair does about 1.2× the work of one user on the same two cards.
+
+How these were measured, figures by context depth and the 27B's build and run details are in [`README-27B.md`](README-27B.md).
+
 Build and run instructions are at the bottom of this page, under [llama-superfast-v100](#llama-superfast-v100).
 
 # llama.cpp
