@@ -180,9 +180,11 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_TU_POLICY: the values to set, -1 for unchanged (validated by the HTTP thread)
     struct tu_policy_set {
-        int32_t enabled  = -1;
-        int32_t slice_ms = -1;
-        int32_t group    = -1;
+        int32_t enabled   = -1;
+        int32_t slice_ms  = -1;
+        int32_t group     = -1;
+        int32_t fix       = -1;
+        int32_t fair_read = -1;
     };
     tu_policy_set tu_set;
 

@@ -307,6 +307,7 @@ struct server_slot {
     // the cached prefix a not-started task's start will reuse, computed once per task (tu_remaining)
     int     tu_prefix_id_task = -1;
     int32_t tu_prefix         = 0;
+    int64_t tu_last_read_seq  = 0;
 
     // effective generation limit for the current task, -1 means unlimited
     int32_t n_predict_max = -1;
@@ -1142,6 +1143,8 @@ private:
         bool    diag     = false; // LLAMA_TU_DIAG: hashes of what a finished prompt read hands the drafter and the sampler
         bool    one_sync = true;  // LLAMA_TU_ONE_SYNC: one llama_decode_job_step a slice; 0 is one step a group
         int32_t force_groups = 1; // LLAMA_TU_FORCE_GROUPS: with force and one sync, the groups of every slice
+        bool    fix          = true; // LLAMA_TU_FIX: two-slot scheduling & decode-throttling fixes
+        bool    fair_read    = true; // LLAMA_TU_FAIR_READ: round-robin multi-batch prefill across active readers
     } tu_policy;
 
     bool tu_engaged = false; // on, the context can run jobs, and more than one slot
@@ -1159,6 +1162,7 @@ private:
     // the reader to serve next, at the start of every iteration (tu_order)
     server_slot * tu_pick      = nullptr;
     server_slot * tu_pick_prev = nullptr; // the previous iteration's, for the pick line (one per switch)
+    int64_t       tu_read_seq  = 0;
 
     // while a job lives: pre_decode fills only this reader's batch, up to tu_fill_limit tokens, with no decode rows
     server_slot * tu_fill_slot  = nullptr;
@@ -1763,6 +1767,8 @@ private:
                 tu_policy.diag     = env_int("LLAMA_TU_DIAG", 0) != 0;
                 tu_policy.one_sync     = env_int("LLAMA_TU_ONE_SYNC", 1) != 0;
                 tu_policy.force_groups = std::max(1, env_int("LLAMA_TU_FORCE_GROUPS", 1));
+                tu_policy.fix          = env_int("LLAMA_TU_FIX", 1) != 0;
+                tu_policy.fair_read    = env_int("LLAMA_TU_FAIR_READ", 1) != 0;
                 tu_seeded = true;
             }
 
@@ -1797,6 +1803,12 @@ private:
             }
             tu_peer_rows = llama_decode_job_peer_rows(ctx_tgt);
             tu_publish();
+            LOG_WRN("[scheduler] startup: tu_capable=%d tu_engaged=%d can_run=%d tu_policy_on=%d n_parallel=%d mctx=%d kv_unified=%d n_ctx=%d n_ctx_slot=%d n_batch=%d n_ubatch=%d type_k=%d type_v=%d force=%d slice_ms=%d group=%d one_sync=%d\n",
+                    (int) tu_capable, (int) tu_engaged, (int) can_run, (int) tu_policy.on,
+                    params_base.n_parallel, (int) (mctx != nullptr), (int) params_base.kv_unified,
+                    (int) llama_n_ctx(ctx_tgt), n_ctx_slot(), (int) llama_n_batch(ctx_tgt), (int) llama_n_ubatch(ctx_tgt),
+                    (int) params_base.cache_type_k, (int) params_base.cache_type_v,
+                    (int) tu_policy.force, tu_policy.slice_ms, tu_policy.group, (int) tu_policy.one_sync);
         }
 
         if (params_base.cache_ram_mib != 0) {
@@ -1997,6 +2009,7 @@ private:
 
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
+        const char * select_reason = "none";
 
         bool update_cache = false;
 
@@ -2005,9 +2018,12 @@ private:
             ret = get_slot_by_id(task.id_slot);
             // the job's slot is not touched before the job ends
             if (ret && ret->tu_owned) {
+                LOG_WRN("[scheduler] slot_select: t_us=%" PRId64 " id_task=%d req_id_slot=%d chosen_slot=-1 reason=by_id_tu_owned task_tokens=%d\n",
+                        ggml_time_us(), task.id, task.id_slot, task.n_tokens());
                 return nullptr;
             }
             if (ret) {
+                select_reason = "by_id";
                 SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
             }
         }
@@ -2050,9 +2066,14 @@ private:
             }
 
             if (ret != nullptr) {
-                const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
+                const float f_keep = ret->prompt.tokens.empty()
+                    ? 1.0f
+                    : (tu_policy.fix
+                        ? float(ret->prompt.tokens.get_common_prefix(task.tokens)) / float(ret->prompt.tokens.size())
+                        : (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size());
 
                 if (task.id_slot == -1) {
+                    select_reason = "lcp_sim";
                     SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
                             f_sim_best, slot_prompt_similarity, f_keep);
                 }
@@ -2075,17 +2096,24 @@ private:
                 }
 
                 // select the current slot if the criteria match
-                if (!ret || slot.t_last_used <= t_last) {
+                if (!ret || (tu_policy.fix ? (slot.t_last_used < t_last) : (slot.t_last_used <= t_last))) {
                     t_last = slot.t_last_used;
                     ret = &slot;
                 }
             }
 
             if (ret != nullptr) {
+                select_reason = "lru";
                 SLT_INF(*ret, "selected slot by LRU, t_last = %" PRId64 "\n", t_last);
 
                 update_cache = true;
             }
+        }
+
+        if (task.type == SERVER_TASK_TYPE_COMPLETION) {
+            LOG_WRN("[scheduler] slot_select: t_us=%" PRId64 " id_task=%d req_id_slot=%d chosen_slot=%d reason=%s t_last_used=%" PRId64 " slot_prompt_tokens=%d task_tokens=%d\n",
+                    ggml_time_us(), task.id, task.id_slot, ret ? ret->id : -1, select_reason,
+                    ret ? ret->t_last_used : (int64_t) -1, ret ? ret->prompt.n_tokens() : 0, task.n_tokens());
         }
 
         if (ret) {
@@ -2093,6 +2121,19 @@ private:
 
             // cache prompts only for completion tasks
             update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
+
+            if (tu_policy.fix && update_cache) {
+                bool peer_busy = false;
+                for (const auto & s : slots) {
+                    if (&s != ret && (s.is_processing() || s.tu_owned)) {
+                        peer_busy = true;
+                        break;
+                    }
+                }
+                if (!params_base.cache_idle_slots || !task.params.cache_prompt || peer_busy) {
+                    update_cache = false;
+                }
+            }
 
             if (update_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
@@ -2305,6 +2346,9 @@ private:
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
         slot.task = std::make_unique<const server_task>(std::move(task));
+        slot.tu_prefix_id_task = slot.task->id;
+        slot.tu_prefix         = slot.task->params.cache_prompt ? (int32_t) slot.prompt.tokens.get_common_prefix(slot.task->tokens) : 0;
+        slot.tu_last_read_seq  = 0;
 
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
@@ -2314,6 +2358,13 @@ private:
         n_empty_consecutive = 0;
 
         SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
+        LOG_WRN("[scheduler] task_launch: t_us=%" PRId64 " id_task=%d slot=%d req_id_slot=%d task_tokens=%d n_predict=%d priority=%d cache_prompt=%d slot_cached_tokens=%d pos_min=%d pos_max=%d tu_eligible=%d\n",
+                ggml_time_us(), slot.task->id, slot.id, slot.task->id_slot, slot.task->n_tokens(),
+                slot.n_predict_max, slot.task->params.priority, (int) slot.task->params.cache_prompt,
+                slot.prompt.n_tokens(),
+                (int) llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
+                (int) llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id),
+                (int) tu_eligible(slot));
         return true;
     }
 
@@ -2574,6 +2625,11 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+        LOG_WRN("[scheduler] task_finish: t_us=%" PRId64 " id_task=%d slot=%d n_prompt=%d n_cached=%d n_gen=%d prompt_ms=%.2f gen_ms=%.2f draft_acc=%d/%d verif_steps=%d\n",
+                ggml_time_us(), slot.task ? slot.task->id : -1, slot.id,
+                slot.task ? slot.task->n_tokens() : 0, (int) slot.stats.n_prompt_cached,
+                (int) slot.stats.n_gen, (double) slot.stats.t_prompt_ms(), slot.stats.t_gen_us() / 1000.0,
+                (int) slot.stats.n_draft_accepted, (int) slot.stats.n_draft_tokens, (int) slot.stats.n_draft_verif_steps);
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
@@ -2882,10 +2938,34 @@ private:
 
     // returns false to decline the task, it is offered again after the decode is done
     bool process_single_task(server_task && task, bool is_yielding) {
+        static int     diag_declined_id    = -1;
+        static int     diag_declined_count = 0;
+        static int64_t diag_declined_t0_us = 0;
+
         // while yielding, an encode / decode is running and only reading the server state is safe
         if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
+            if (task.type == SERVER_TASK_TYPE_COMPLETION) {
+                const int64_t now_us = ggml_time_us();
+                if (diag_declined_id != task.id) {
+                    diag_declined_id    = task.id;
+                    diag_declined_count = 1;
+                    diag_declined_t0_us = now_us;
+                    LOG_WRN("[scheduler] task_declined_yielding: t_us=%" PRId64 " id_task=%d req_id_slot=%d task_tokens=%d\n",
+                            now_us, task.id, task.id_slot, task.n_tokens());
+                } else {
+                    diag_declined_count++;
+                }
+            }
             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
             return false;
+        }
+
+        if (!is_yielding && task.type == SERVER_TASK_TYPE_COMPLETION && diag_declined_id == task.id && diag_declined_count > 0) {
+            const int64_t now_us = ggml_time_us();
+            LOG_WRN("[scheduler] task_admitted_after_yield: t_us=%" PRId64 " id_task=%d req_id_slot=%d declined_count=%d yield_wait_ms=%.3f\n",
+                    now_us, task.id, task.id_slot, diag_declined_count, (now_us - diag_declined_t0_us) / 1000.0);
+            diag_declined_id    = -1;
+            diag_declined_count = 0;
         }
 
         // [TAG_SPEC_PIPELINE] a task other than the loop's own may change a slot or the caches: verify what is in flight
@@ -2917,6 +2997,8 @@ private:
 
                     if (slot == nullptr) {
                         // if no slot is available, we defer this task for processing later
+                        LOG_WRN("[scheduler] task_deferred: t_us=%" PRId64 " id_task=%d req_id_slot=%d reason=no_slot_available task_tokens=%d\n",
+                                ggml_time_us(), id_task, task.id_slot, task.n_tokens());
                         SRV_DBG("no slot is available, defer task, id_task = %d\n", id_task);
                         queue_tasks.defer(std::move(task));
                         break;
@@ -2924,6 +3006,9 @@ private:
 
                     if (slot->is_processing() || slot->tu_owned) {
                         // if requested slot is unavailable, we defer this task for processing later
+                        LOG_WRN("[scheduler] task_deferred: t_us=%" PRId64 " id_task=%d req_id_slot=%d slot=%d reason=%s task_tokens=%d\n",
+                                ggml_time_us(), id_task, task.id_slot, slot->id,
+                                slot->tu_owned ? "slot_tu_owned" : "slot_processing", task.n_tokens());
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", id_task);
                         queue_tasks.defer(std::move(task));
                         break;
@@ -3035,10 +3120,16 @@ private:
                         llama_decode_job_set_layers(ctx_tgt, set.group); // rounded up to the period, clamped to the layer count
                         tu_policy.group = llama_decode_job_get_layers(ctx_tgt);
                     }
+                    if (set.fix >= 0) {
+                        tu_policy.fix = set.fix != 0;
+                    }
+                    if (set.fair_read >= 0) {
+                        tu_policy.fair_read = set.fair_read != 0;
+                    }
                     tu_engaged = tu_policy.on && tu_capable;
                     tu_version++;
-                    LOG_WRN("TU policy: version %d, enabled %d, slice %d ms, group %d layers (POST /props)\n",
-                            tu_version, (int) tu_engaged, tu_policy.slice_ms, tu_policy.group);
+                    LOG_WRN("TU policy: version %d, enabled %d, slice %d ms, group %d layers, fix %d, fair_read %d (POST /props)\n",
+                            tu_version, (int) tu_engaged, tu_policy.slice_ms, tu_policy.group, (int) tu_policy.fix, (int) tu_policy.fair_read);
                     tu_publish();
 
                     auto res = std::make_unique<server_task_result_tu_policy>();
@@ -3232,6 +3323,7 @@ private:
                     const size_t n_erased = slot->prompt.tokens.size();
 
                     slot->prompt_clear();
+                    slot->t_last_used = -1;
 
                     auto res = std::make_unique<server_task_result_slot_erase>();
                     res->id       = task.id;
@@ -4486,10 +4578,13 @@ private:
             return;
         }
 
+        const int32_t fast_limit = llama_n_batch(ctx_tgt);
         struct reader {
             server_slot * slot;
             int32_t       priority;
             int32_t       remaining;
+            int32_t       uncached;
+            int64_t       last_seq;
             int           id_task;
         };
         std::vector<reader> readers;
@@ -4497,16 +4592,34 @@ private:
             const bool reading = (tu_job.active && tu_job.slot == &slot) ||
                 slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT;
             if (reading && tu_eligible(slot)) {
-                readers.push_back({ &slot, slot.task->params.priority, tu_remaining(slot), slot.task->id });
+                const int32_t rem = tu_remaining(slot);
+                const int32_t unc = std::max(rem, (int32_t) slot.task->n_tokens() - slot.tu_prefix);
+                readers.push_back({ &slot, slot.task->params.priority, rem, unc, slot.tu_last_read_seq, slot.task->id });
             }
         }
         if (readers.empty()) {
             tu_pick_prev = nullptr;
             return;
         }
-        std::sort(readers.begin(), readers.end(), [](const reader & a, const reader & b) {
+        std::sort(readers.begin(), readers.end(), [&](const reader & a, const reader & b) {
             if (a.priority != b.priority) {
                 return a.priority > b.priority;
+            }
+            if (tu_policy.fix && tu_policy.fair_read) {
+                const bool a_short = a.uncached <= fast_limit;
+                const bool b_short = b.uncached <= fast_limit;
+                if (a_short != b_short) {
+                    return a_short;
+                }
+                if (!a_short) {
+                    if (tu_job.active && (a.slot == tu_job.slot) != (b.slot == tu_job.slot)) {
+                        return a.slot == tu_job.slot;
+                    }
+                    if (a.last_seq != b.last_seq) {
+                        return a.last_seq < b.last_seq;
+                    }
+                    return a.id_task < b.id_task;
+                }
             }
             if (a.remaining != b.remaining) {
                 return a.remaining < b.remaining;
@@ -4514,6 +4627,39 @@ private:
             return a.id_task < b.id_task;
         });
         tu_pick = readers[0].slot;
+
+        {
+            static int  last_pick_slot = -1;
+            static int  last_n_readers = 0;
+            static int  last_task_0    = -1;
+            static int  last_task_1    = -1;
+            static bool last_job_act   = false;
+            const int cur_pick_slot = tu_pick ? tu_pick->id : -1;
+            const int cur_n_readers = (int) readers.size();
+            const int cur_task_0    = readers[0].id_task;
+            const int cur_task_1    = readers.size() > 1 ? readers[1].id_task : -1;
+            if (cur_pick_slot != last_pick_slot || cur_n_readers != last_n_readers ||
+                cur_task_0 != last_task_0 || cur_task_1 != last_task_1 || tu_job.active != last_job_act) {
+                std::string r_str;
+                for (size_t i = 0; i < readers.size(); ++i) {
+                    if (i > 0) r_str += ";";
+                    r_str += "s" + std::to_string(readers[i].slot->id) +
+                             "(t=" + std::to_string(readers[i].id_task) +
+                             ",p=" + std::to_string(readers[i].priority) +
+                             ",rem=" + std::to_string(readers[i].remaining) +
+                             ",st=" + std::to_string((int) readers[i].slot->state) + ")";
+                }
+                LOG_WRN("[scheduler] tu_order: t_us=%" PRId64 " tu_engaged=%d tu_job_active=%d tu_job_slot=%d n_readers=%d tu_pick=%d readers=[%s]\n",
+                        ggml_time_us(), (int) tu_engaged, (int) tu_job.active,
+                        tu_job.active && tu_job.slot ? tu_job.slot->id : -1,
+                        cur_n_readers, cur_pick_slot, r_str.c_str());
+                last_pick_slot = cur_pick_slot;
+                last_n_readers = cur_n_readers;
+                last_task_0    = cur_task_0;
+                last_task_1    = cur_task_1;
+                last_job_act   = tu_job.active;
+            }
+        }
 
         if (tu_pick_prev != nullptr && tu_pick_prev != tu_pick) {
             for (const auto & r : readers) {
@@ -4537,6 +4683,8 @@ private:
             { "group",     tu_policy.group },
             { "force",     tu_policy.force },
             { "diag",      tu_policy.diag },
+            { "fix",       tu_policy.fix },
+            { "fair_read", tu_policy.fair_read },
             { "peer_rows", tu_peer_rows },
             { "version",   tu_version },
         };
@@ -4955,7 +5103,14 @@ private:
         // one slot reading its prompt while another is generating (or LLAMA_TU_FORCE): its logical batch goes to the
         // job's batch, filled to n_batch on its own, so its ubatches are the ones it has alone. None while a job lives
         // the reader to serve next (tu_order) is that slot; the other eligible readers wait
-        const bool tu_fill = tu_engaged && !tu_job.active && tu_pick != nullptr && (tu_policy.force || !generating.empty());
+        // when tu_policy.fix is active, a multi-ubatch read (> tu_peer_rows when idle, > 8 when decoding)
+        // runs as a sliced job so arriving warm or shorter requests are admitted within one slice, while 1-token warm
+        // prompts co-batch directly without an extra job pass
+        const bool tu_fill = tu_engaged && !tu_job.active && tu_pick != nullptr &&
+            (tu_policy.force ||
+             (tu_policy.fix
+                 ? (tu_remaining(*tu_pick) > (generating.empty() ? tu_peer_rows : 8))
+                 : !generating.empty()));
 
         // a reader's batch alone while a job lives (tu_read_other): its own limit
         const bool    fill_only = tu_fill_slot != nullptr;
@@ -4965,7 +5120,37 @@ private:
         if ((!tu_job.active || fill_only) && (params_base.cont_batching || batch.size() == 0)) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
-            iterate(slots, [&](server_slot & slot) {
+            std::vector<server_slot *> prompt_slots;
+            prompt_slots.reserve(slots.size());
+            for (server_slot & slot : slots) {
+                prompt_slots.push_back(&slot);
+            }
+            if (tu_policy.fix && prompt_slots.size() > 1) {
+                std::stable_sort(prompt_slots.begin(), prompt_slots.end(), [&](server_slot * a, server_slot * b) {
+                    const bool a_proc = a->is_processing() && a->task != nullptr;
+                    const bool b_proc = b->is_processing() && b->task != nullptr;
+                    if (a_proc != b_proc) {
+                        return a_proc;
+                    }
+                    if (!a_proc) {
+                        return false;
+                    }
+                    if (tu_pick != nullptr && (a == tu_pick) != (b == tu_pick)) {
+                        return a == tu_pick;
+                    }
+                    const bool a_short = tu_remaining(*a) <= tu_peer_rows;
+                    const bool b_short = tu_remaining(*b) <= tu_peer_rows;
+                    if (a_short != b_short) {
+                        return a_short;
+                    }
+                    if (a->task->params.priority != b->task->params.priority) {
+                        return a->task->params.priority > b->task->params.priority;
+                    }
+                    return a->task->id < b->task->id;
+                });
+            }
+
+            iterate(prompt_slots, [&](server_slot & slot) {
                 if (!add_ok || batch.size() >= n_fill) {
                     return; // batch is full, skip remaining slots
                 }
@@ -4989,8 +5174,39 @@ private:
                 if (fill_only && &slot != tu_fill_slot) {
                     return;
                 }
-                if (!fill_only && tu_pick != nullptr && &slot != tu_pick && tu_eligible(slot) &&
+                if (tu_policy.fix && !tu_engaged && tu_remaining(slot) > tu_peer_rows) {
+                    if (slot_batched != nullptr && tu_remaining(*slot_batched) <= tu_peer_rows) {
+                        return;
+                    }
+                    if (!generating.empty()) {
+                        bool gen_finishing_soon = false;
+                        for (const server_slot * g : generating) {
+                            if (g->n_remaining() > 0 && g->n_remaining() <= 32) {
+                                gen_finishing_soon = true;
+                                break;
+                            }
+                        }
+                        if (gen_finishing_soon) {
+                            return;
+                        }
+                    }
+                }
+                const bool allow_co_warm = tu_policy.fix && !tu_job.active &&
+                    !tu_policy.force && tu_pick != nullptr && tu_remaining(*tu_pick) <= 8 && tu_remaining(slot) <= 8;
+                if (!fill_only && tu_pick != nullptr && &slot != tu_pick && tu_eligible(slot) && !allow_co_warm &&
                         (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT)) {
+                    static int last_skip_slot = -1;
+                    static int last_skip_task = -1;
+                    static int last_pick_task = -1;
+                    const int cur_pick_task = tu_pick->task ? tu_pick->task->id : -1;
+                    if (slot.id != last_skip_slot || slot.task->id != last_skip_task || cur_pick_task != last_pick_task) {
+                        LOG_WRN("[scheduler] pre_decode_skip_reader: t_us=%" PRId64 " skipped_slot=%d skipped_task=%d skipped_rem=%d tu_pick_slot=%d tu_pick_task=%d tu_job_active=%d\n",
+                                ggml_time_us(), slot.id, slot.task->id, tu_remaining(slot),
+                                tu_pick->id, cur_pick_task, (int) tu_job.active);
+                        last_skip_slot = slot.id;
+                        last_skip_task = slot.task->id;
+                        last_pick_task = cur_pick_task;
+                    }
                     return;
                 }
 
@@ -5552,6 +5768,15 @@ private:
                     if (do_checkpoint) {
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
                     }
+
+                    if (n_tokens_cur > 0) {
+                        slot.tu_last_read_seq = ++tu_read_seq;
+                        LOG_WRN("[scheduler] pre_decode_prompt: t_us=%" PRId64 " slot=%d id_task=%d target=%s to_job=%d tu_fill=%d fill_only=%d gen_slots=%zu added=%d prompt_pos=%d/%d batch_size=%d batch_tu_size=%d pos_min=%d pos_max=%d\n",
+                                ggml_time_us(), slot.id, slot.task->id, to_job ? "batch_tu" : "batch",
+                                (int) to_job, (int) tu_fill, (int) fill_only, generating.size(),
+                                (int) n_tokens_cur, slot.prompt.n_tokens(), slot.task->n_tokens(),
+                                batch.size(), batch_tu.size(), (int) pos_min, (int) pos_max);
+                    }
                 }
 
                 if (to_job) {
@@ -5562,6 +5787,30 @@ private:
                     slot_batched = &slot;
                 }
             });
+        }
+
+        if (batch.size() > 0 || batch_tu.size() > 0) {
+            int s0_dec = 0, s0_p = 0, s1_dec = 0, s1_p = 0;
+            for (const auto & t : batch.tokens) {
+                if (t.id_slot == 0) {
+                    if (t.is_prompt) s0_p++; else s0_dec++;
+                } else if (t.id_slot == 1) {
+                    if (t.is_prompt) s1_p++; else s1_dec++;
+                }
+            }
+            static int dec_step_count = 0;
+            const bool has_prompt = (s0_p + s1_p > 0) || (batch_tu.size() > 0);
+            if (has_prompt) {
+                dec_step_count = 0;
+            } else {
+                dec_step_count++;
+            }
+            if (has_prompt || dec_step_count <= 3 || (dec_step_count % 10 == 0)) {
+                LOG_WRN("[scheduler] pre_decode_summary: t_us=%" PRId64 " gen_slots=%zu tu_engaged=%d tu_job_active=%d tu_pick=%d tu_fill=%d fill_only=%d batch_size=%d s0_dec=%d s0_p=%d s1_dec=%d s1_p=%d batch_tu_size=%d dec_step=%d\n",
+                        ggml_time_us(), generating.size(), (int) tu_engaged, (int) tu_job.active,
+                        tu_pick ? tu_pick->id : -1, (int) tu_fill, (int) fill_only,
+                        batch.size(), s0_dec, s0_p, s1_dec, s1_p, batch_tu.size(), dec_step_count);
+            }
         }
     }
 
@@ -5808,6 +6057,10 @@ private:
                 slot.stats.update_prompt_last();
                 slot.t_print_last = t_now;
                 slot.n_gen_last = 0;
+                LOG_WRN("[scheduler] prompt_done: t_us=%" PRId64 " id_task=%d slot=%d n_prompt=%d n_cached=%d prompt_ms=%.2f first_tok=%d\n",
+                        t_now, slot.task ? slot.task->id : -1, slot.id,
+                        slot.task ? slot.task->n_tokens() : 0, (int) slot.stats.n_prompt_cached,
+                        (double) slot.stats.t_prompt_ms(), (int) id);
             }
 
             slot.stats.update_gen_last();
@@ -6856,6 +7109,18 @@ void server_routes::init_routes() {
                         err = "tu.group must be a positive integer (layers per group)";
                     } else {
                         task.tu_set.group = (int32_t) std::min<int64_t>(v.get<int64_t>(), INT32_MAX);
+                    }
+                } else if (key == "fix") {
+                    if (!v.is_boolean()) {
+                        err = "tu.fix must be true or false";
+                    } else {
+                        task.tu_set.fix = v.get<bool>() ? 1 : 0;
+                    }
+                } else if (key == "fair_read") {
+                    if (!v.is_boolean()) {
+                        err = "tu.fair_read must be true or false";
+                    } else {
+                        task.tu_set.fair_read = v.get<bool>() ? 1 : 0;
                     }
                 } else if (key == "force" || key == "diag" || key == "peer_rows") {
                     err = "tu." + key + " is set at startup only";
